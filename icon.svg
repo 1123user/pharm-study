@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="100" height="100">
+  <defs>
+    <linearGradient id="plate" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#44a08c"/>
+      <stop offset="1" stop-color="#32806f"/>
+    </linearGradient>
+    <clipPath id="cap">
+      <rect x="21.25" y="39.75" width="57.5" height="20.5" rx="10.25"/>
+    </clipPath>
+    <clipPath id="plateClip">
+      <rect width="100" height="100" rx="22.5"/>
+    </clipPath>
+  </defs>
+
+  <g clip-path="url(#plateClip)">
+    <rect width="100" height="100" fill="url(#plate)"/>
+
+    <g transform="rotate(-35 50 50)">
+      <rect x="21.25" y="39.75" width="57.5" height="20.5" rx="10.25" fill="#fff"/>
+      <g clip-path="url(#cap)">
+        <rect x="21.25" y="39.75" width="24.2" height="20.5" fill="#cf5a7c"/>
+      </g>
+      <circle cx="45.4" cy="50" r="8.2" fill="#fff"/>
+      <rect x="40.5" y="49" width="9.8" height="2" fill="#cf5a7c"/>
+      <rect x="44.4" y="45.1" width="2" height="9.8" fill="#cf5a7c"/>
+    </g>
+  </g>
+</svg>
