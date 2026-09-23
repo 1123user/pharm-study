@@ -82,8 +82,12 @@
     topTitle: $("topTitle"),
     topSub: $("topSub"),
     progressStrip: $("progressStrip"),
+    progressTrack: $("progressTrack"),
     progressBar: $("progressBar"),
+    progressCur: $("progressCur"),
+    progressKnob: $("progressKnob"),
     progressText: $("progressText"),
+    progressTip: $("progressTip"),
     viewHome: $("viewHome"),
     viewStudy: $("viewStudy"),
     actionbar: $("actionbar"),
@@ -788,10 +792,8 @@
     dom.topTitle.textContent = subj.name;
     dom.topSub.textContent = item.title;
 
-    var doneCount = Object.keys(p.done || {}).length;
     dom.progressStrip.hidden = false;
-    dom.progressBar.style.width = Math.round((doneCount / subj.items.length) * 100) + "%";
-    dom.progressText.textContent = doneCount + " / " + subj.items.length + " 已掌握";
+    renderProgress();
 
     renderSidebar();
     renderActionbar();
@@ -1017,8 +1019,7 @@
       "</div></div></div>";
     dom.actionbar.hidden = true;
     dom.viewStudy.scrollTop = 0;
-    dom.progressBar.style.width = "100%";
-    dom.progressText.textContent = n + " / " + subj.items.length + " 已掌握";
+    renderProgress();
   }
 
   /* ---------------- 进入科目 ---------------- */
@@ -2375,7 +2376,7 @@
       // 带版本号注册 + updateViaCache:"none"：
       // 1) URL 变化可绕过 CDN / 浏览器的旧缓存；
       // 2) 浏览器定期更新检查时也强制回源，避免长期停留在旧版 Service Worker。
-      navigator.serviceWorker.register("sw.js?v=29", { updateViaCache: "none" })
+      navigator.serviceWorker.register("sw.js?v=30", { updateViaCache: "none" })
         .then(function (reg) { if (reg && reg.update) reg.update(); })
         .catch(function () {});
     });
@@ -2400,6 +2401,140 @@
 
   dom.viewStudy.addEventListener("scroll", onStudyScroll, { passive: true });
   window.addEventListener("resize", onStudyScroll);
+
+  /* ---------------- 上方进度条：任选知识点跳转 ----------------
+     进度条同时充当选择器：按住拖动（或直接点按）时浮层实时显示目标
+     知识点，松手即跳。像素按条内坐标换算成序号，与 applyScope()
+     处理后的真实顺序一致。 */
+  var stripDrag = false;
+  var stripRatio = 0;
+
+  function renderProgress() {
+    var subj = currentSubject();
+    if (!subj) return;
+    var n = subj.items.length;
+    var done = Object.keys(subProgress(subj.id).done || {}).length;
+    if (dom.progressBar) {
+      dom.progressBar.style.width = (n ? Math.round((done / n) * 100) : 0) + "%";
+    }
+    if (dom.progressText) {
+      dom.progressText.textContent = done + " / " + n + " 已掌握";
+    }
+    // 当前位置标记按条目序号定位（「已掌握」比例是另一个维度）
+    if (dom.progressCur) {
+      var last = n - 1;
+      var r = last > 0 ? Math.max(0, Math.min(state.index, last)) / last : 0;
+      dom.progressCur.style.left = (r * 100) + "%";
+    }
+    // 进度条是 role="slider"，同步当前值供辅助功能读取
+    if (dom.progressTrack && n) {
+      dom.progressTrack.setAttribute("aria-valuemin", "1");
+      dom.progressTrack.setAttribute("aria-valuemax", String(n));
+      dom.progressTrack.setAttribute("aria-valuenow", String(Math.min(state.index + 1, n)));
+    }
+  }
+
+  function stripIndexAt(clientX) {
+    var subj = currentSubject();
+    if (!subj || !subj.items.length || !dom.progressTrack) return -1;
+    var box = dom.progressTrack.getBoundingClientRect();
+    if (!box.width) return -1;
+    stripRatio = Math.max(0, Math.min(1, (clientX - box.left) / box.width));
+    var i = Math.floor(stripRatio * subj.items.length);
+    return Math.max(0, Math.min(i, subj.items.length - 1));
+  }
+
+  function showProgressTip(clientX, text) {
+    var tip = dom.progressTip;
+    if (!tip || !dom.progressTrack) return;
+    tip.textContent = text;
+    tip.hidden = false;
+    var box = dom.progressTrack.getBoundingClientRect();
+    var edge = Math.min(80, window.innerWidth / 2);
+    tip.style.left = Math.round(Math.max(edge, Math.min(clientX, window.innerWidth - edge))) + "px";
+    tip.style.top = Math.round(box.top - 8) + "px";
+  }
+
+  function hideProgressTip() {
+    if (dom.progressTip) dom.progressTip.hidden = true;
+    if (dom.progressKnob) dom.progressKnob.hidden = true;
+  }
+
+  function stripPreview(clientX) {
+    var i = stripIndexAt(clientX);
+    if (i < 0) return -1;
+    var subj = currentSubject();
+    var it = subj.items[i];
+    var p = subProgress(subj.id);
+    if (dom.progressKnob) {
+      dom.progressKnob.hidden = false;
+      dom.progressKnob.style.left = (stripRatio * 100) + "%";
+    }
+    // 刻意不改动条尾那行文字：它一变短就会把条体挤宽，
+    // 导致松手时的坐标换算与手指实际位置对不上，跳错条目。
+    // 目标知识点改由浮层显示，信息还更全。
+    showProgressTip(clientX, "第 " + (i + 1) + "/" + subj.items.length + " · " + it.title +
+      (p.done && p.done[it.id] ? " · 已掌握" : ""));
+    return i;
+  }
+
+  /* 跳到本科目第 i 个知识点；该条留过阅读位置时，一并回到当时那一屏 */
+  function jumpToIndex(i) {
+    var subj = currentSubject();
+    if (!subj || !subj.items.length) return;
+    var n = subj.items.length;
+    i = Math.max(0, Math.min(i, n - 1));
+    // 目标正是当前这条：不打断阅读，只把进度条恢复原样
+    if (i === state.index && !state.finished) { renderProgress(); return; }
+    var it = subj.items[i];
+    var p = subProgress(subj.id);
+    var pos = p.pos && p.pos.id === it.id ? p.pos : null;
+    state.index = i;
+    state.finished = false;
+    state.page = pos ? Math.max(0, Math.min(pos.pg || 0, it.pages.length - 1)) : 0;
+    state.restoreScroll = pos ? Math.max(0, pos.top || 0) : 0;
+    p.at = i;
+    p.ts = Date.now();
+    saveProgress();
+    renderStudy();
+    toast("已跳到 " + (i + 1) + "/" + n + " · " + it.title);
+    try { history.replaceState(null, "", "#/" + subj.id + "/" + (i + 1)); } catch (e) {}
+  }
+
+  if (dom.progressTrack) {
+    dom.progressTrack.addEventListener("pointerdown", function (e) {
+      if (!state.subjectId || !currentSubject()) return;
+      stripDrag = true;
+      try { dom.progressTrack.setPointerCapture(e.pointerId); } catch (err) {}
+      stripPreview(e.clientX);
+      e.preventDefault();
+    });
+    dom.progressTrack.addEventListener("pointermove", function (e) {
+      if (!stripDrag) return;
+      stripPreview(e.clientX);
+      e.preventDefault();
+    });
+    dom.progressTrack.addEventListener("pointerup", function (e) {
+      if (!stripDrag) return;
+      stripDrag = false;
+      var i = stripIndexAt(e.clientX);
+      hideProgressTip();
+      if (i >= 0) jumpToIndex(i); else renderProgress();
+    });
+    dom.progressTrack.addEventListener("pointercancel", function () {
+      if (!stripDrag) return;
+      stripDrag = false;
+      hideProgressTip();
+      renderProgress();
+    });
+    // 键盘也可操作（左右方向键逐条切换）
+    dom.progressTrack.addEventListener("keydown", function (e) {
+      if (!state.subjectId) return;
+      if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+      jumpToIndex(state.index + (e.key === "ArrowRight" ? 1 : -1));
+      e.preventDefault();
+    });
+  }
   // 退出页面 / 切到后台时立刻落盘，保证下次打开能精确回到原位
   window.addEventListener("pagehide", function () { savePosition(true); });
   document.addEventListener("visibilitychange", function () {

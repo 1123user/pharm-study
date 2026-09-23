@@ -487,11 +487,14 @@ svg { display: block; }
   background: var(--bg-elevated);
 }
 .progress-strip .bar {
+  position: relative;
   flex: 1;
   height: 6px;
   border-radius: 99px;
   background: var(--surface-3);
-  overflow: hidden;
+  /* 位置标记与拖动旋钮会略微溢出条体，因此这里不裁剪 */
+  cursor: pointer;
+  touch-action: none;
 }
 .progress-strip .bar i {
   display: block;
@@ -499,6 +502,50 @@ svg { display: block; }
   border-radius: 99px;
   background: var(--accent);
   transition: width .35s cubic-bezier(.32, .72, 0, 1);
+  pointer-events: none;
+}
+/* 当前位置：细竖线，横跨条体上下，便于一眼看出读到哪 */
+.progress-strip .pg-cur {
+  position: absolute;
+  top: -3px;
+  bottom: -3px;
+  width: 2px;
+  margin-left: -1px;
+  border-radius: 2px;
+  background: var(--fg);
+  opacity: .45;
+  pointer-events: none;
+}
+/* 拖动时的圆形旋钮 */
+.progress-strip .pg-knob {
+  position: absolute;
+  top: 50%;
+  width: 15px;
+  height: 15px;
+  margin: -7.5px 0 0 -7.5px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 2px solid var(--bg-elevated);
+  box-shadow: 0 2px 7px rgba(0, 0, 0, .3);
+  pointer-events: none;
+}
+/* 拖动时跟随手指的知识点提示 */
+.pg-tip {
+  position: fixed;
+  z-index: 90;
+  transform: translate(-50%, -100%);
+  max-width: 78vw;
+  padding: 6px 10px;
+  border-radius: 9px;
+  background: rgba(18, 20, 24, .94);
+  color: #fff;
+  font-size: 12px;
+  line-height: 1.35;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  pointer-events: none;
+  box-shadow: 0 8px 22px rgba(0, 0, 0, .28);
 }
 .progress-strip span {
   font-size: 12px;

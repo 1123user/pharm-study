@@ -18,7 +18,7 @@
 <link rel="icon" href="icon.svg" type="image/svg+xml">
 <link rel="icon" type="image/png" sizes="192x192" href="icon-192.png">
 <!-- 资源版本号：变更前端代码时同步 +1，可强制绕过 CDN / 浏览器旧缓存 -->
-<link rel="stylesheet" href="css/app.css?v=29">
+<link rel="stylesheet" href="css/app.css?v=30">
 </head>
 <body>
 <div class="app">
@@ -83,7 +83,13 @@
     </header>
 
     <div class="progress-strip" id="progressStrip" hidden>
-      <div class="bar"><i id="progressBar" style="width:0%"></i></div>
+      <!-- 进度条同时是「知识点选择器」：点按或拖动可选任意知识点跳转 -->
+      <div class="bar" id="progressTrack" tabindex="0" role="slider"
+        aria-label="拖动或点击进度条，选择知识点跳转">
+        <i id="progressBar" style="width:0%"></i>
+        <b class="pg-cur" id="progressCur"></b>
+        <b class="pg-knob" id="progressKnob" hidden></b>
+      </div>
       <span id="progressText">0 / 0</span>
     </div>
 
@@ -129,6 +135,8 @@
   <div class="sch-list" id="schList"></div>
 </div>
 
+<div class="pg-tip" id="progressTip" hidden></div>
+
 <div class="toast" id="toast" hidden></div>
 
 <div class="overlay auth-gate" id="authGate">
@@ -149,7 +157,7 @@
   </div>
 </div>
 
-<script src="js/supabase.js?v=29"></script>
-<script src="js/app.js?v=29"></script>
+<script src="js/supabase.js?v=30"></script>
+<script src="js/app.js?v=30"></script>
 </body>
 </html>
