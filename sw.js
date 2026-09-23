@@ -1,7 +1,7 @@
 /* 药学知识 · 离线缓存 Service Worker */
-const CACHE = "pharm-study-v28";
+const CACHE = "pharm-study-v29";
 // 资源版本号：与 index.html 中的 ?v= 保持一致，变更前端代码时同步 +1
-const VER = "28";
+const VER = "29";
 // 只预缓存无需鉴权的应用外壳；数据内容通过 Supabase Edge Function 鉴权后获取，
 // 由运行时 fetch 分支在登录后按需缓存，避免 install 阶段因未鉴权 401 而失败。
 const CORE = [

@@ -48,6 +48,9 @@
     confirmed: false,
     unlocked: false,
     finished: false,
+    // 一次性滚动恢复目标（像素）。由 renderStudy() 在下一帧应用，
+    // 用于「重新打开应用直接回到上次看的那一屏」。
+    restoreScroll: null,
     // 数据里已不含大纲外条目（构建时剔除），这里恒为 true
     onlyOutline: true,
     syncCode: localStorage.getItem(SYNC_KEY) || "",
@@ -113,6 +116,7 @@
   }
   function subProgress(id) {
     if (!progress[id]) progress[id] = { done: {}, current: null, at: 0 };
+    if (!progress[id].marks) progress[id].marks = {};
     return progress[id];
   }
 
@@ -502,6 +506,35 @@
         "</button>";
     }
 
+    // 我的标记：跨科目汇总，点一下直接跳回该知识点
+    var marks = [];
+    SUBJECTS.forEach(function (s) {
+      var p = progress[s.id];
+      if (!p || !p.marks) return;
+      Object.keys(p.marks).forEach(function (mid) {
+        var m = p.marks[mid] || {};
+        marks.push({ subj: s.id, name: s.name, id: mid, title: m.title || mid, pg: m.pg || 0, ts: m.ts || 0 });
+      });
+    });
+    marks.sort(function (a, b) { return (b.ts || 0) - (a.ts || 0); });
+    var marksHtml = "";
+    if (marks.length) {
+      var shown = marks.slice(0, 8);
+      marksHtml =
+        '<div class="home-marks"><div class="hm-head"><strong>★ 我的标记</strong>' +
+        "<span>" + marks.length + " 个</span>" +
+        '<button type="button" class="hm-clear" data-marks-clear="1">清空</button></div>' +
+        '<div class="hm-rows">' + shown.map(function (m) {
+          return '<button type="button" class="mark-row" data-mark-subj="' + m.subj +
+            '" data-mark-id="' + esc(m.id) + '" data-mark-pg="' + (m.pg || 0) + '">' +
+            '<span class="mr-dot ' + m.subj + '"></span>' +
+            '<span class="mr-t">' + esc(m.title) + "</span>" +
+            "<em>" + esc(m.name) + "</em></button>";
+        }).join("") + "</div>" +
+        (marks.length > shown.length ? '<div class="hm-more">仅显示最近 ' + shown.length + " 个</div>" : "") +
+        "</div>";
+    }
+
     var cards = SUBJECTS.map(function (s) {
       var p = progress[s.id] || { done: {} };
       var n = Object.keys(p.done || {}).length;
@@ -556,6 +589,7 @@
       '<span class="pill">' + (pillCount("anal")) + " 名词</span></div></div>" +
       planHtml +
       continueHtml +
+      marksHtml +
       '<div class="home-grid">' + cards + "</div>" +
       '<div class="tip-note"><b>使用方式：</b>底部「上一页 / 下一页」逐页浏览，' +
       "翻过某条内容的最后一页即记为已掌握；左侧菜单可开关「仅显示大纲内容」，" +
@@ -724,11 +758,17 @@
       footNote = '<div class="card-foot-note">本知识点已确认，点击下方按钮继续</div>';
     }
 
+    var marked = !!(p.marks && p.marks[item.id]);
     dom.viewStudy.innerHTML =
       '<div class="inner"><div class="card">' +
       '<div class="card-head">' +
       '<div class="card-crumb">' + crumbs + "</div>" +
+      '<div class="title-row">' +
       '<h1 class="card-title">' + titleHtml + "</h1>" +
+      '<button type="button" class="mark-btn' + (marked ? " on" : "") + '" id="markBtn"' +
+      ' aria-pressed="' + (marked ? "true" : "false") + '" aria-label="标记本知识点">' +
+      (marked ? "★" : "☆") + "<span>" + (marked ? "已标记" : "标记") + "</span></button>" +
+      "</div>" +
       (subj.id === "organic" && item.subtitle ? '<p class="card-sub">' + esc(item.subtitle) + "</p>" : "") +
       (subj.id === "pharm" ? '<p class="card-sub">' + esc(item.module || "") + " · 临床首选药</p>" : "") +
       tagsHtml +
@@ -755,7 +795,22 @@
 
     renderSidebar();
     renderActionbar();
-    requestAnimationFrame(checkScroll);
+
+    // 应用一次性滚动恢复目标：重开应用时回到上次看的那一屏
+    var wantTop = state.restoreScroll;
+    state.restoreScroll = null;
+    requestAnimationFrame(function () {
+      var v = dom.viewStudy;
+      if (wantTop != null) v.scrollTop = wantTop;
+      checkScroll();
+      if (wantTop != null) {
+        // 图片为懒加载，加载完成后内容变高，再校准一次位置
+        setTimeout(function () {
+          if (v.scrollTop < wantTop - 4) v.scrollTop = wantTop;
+          checkScroll();
+        }, 140);
+      }
+    });
   }
 
   function renderActionbar() {
@@ -776,6 +831,34 @@
       (first ? " disabled" : "") + ">‹ 上一页</button>" +
       '<button type="button" class="btn btn-primary" id="navNext"' +
       (last && lastItem ? " disabled" : "") + ">下一页 ›</button></div>";
+  }
+
+  /* ---------------- 阅读位置记忆 ----------------
+     记录「知识点 id + 页码 + 滚动像素」。刻意不用序号：applyScope() 会把
+     今日计划章节重排到最前，序号会漂移，只有 id 才是稳定的定位锚。 */
+  var posTimer = null;
+
+  function savePosition(silent) {
+    if (!state.subjectId || state.finished) return;
+    var subj = currentSubject();
+    var item = currentItem();
+    if (!subj || !item) return;
+    var p = subProgress(subj.id);
+    p.pos = {
+      id: item.id,
+      pg: state.page,
+      top: Math.max(0, Math.round(dom.viewStudy.scrollTop || 0)),
+      ts: Date.now()
+    };
+    // 滚动过程中只写本机，避免高频触发云端同步；切页/退出时才走完整保存
+    if (silent) saveProgressRaw(); else saveProgress();
+  }
+
+  function onStudyScroll() {
+    checkScroll();
+    if (!state.subjectId || state.finished) return;
+    if (posTimer) return;
+    posTimer = setTimeout(function () { posTimer = null; savePosition(true); }, 350);
   }
 
   function checkScroll() {
@@ -856,6 +939,45 @@
     }
   }
 
+  /* 标记 / 取消标记当前知识点。
+     只更新按钮自身，不重建卡片 —— 避免打断当前阅读位置。 */
+  function toggleMark() {
+    var subj = currentSubject();
+    var it = currentItem();
+    if (!subj || !it) return;
+    var p = subProgress(subj.id);
+    var wasOn = !!(p.marks && p.marks[it.id]);
+    if (wasOn) {
+      delete p.marks[it.id];
+      toast("已取消标记");
+    } else {
+      p.marks[it.id] = { ts: Date.now(), title: it.title, pg: state.page };
+      toast("已标记 · " + it.title);
+    }
+    saveProgress();
+    var btn = $("markBtn");
+    if (btn) {
+      var on = !wasOn;
+      btn.classList.toggle("on", on);
+      btn.setAttribute("aria-pressed", on ? "true" : "false");
+      btn.innerHTML = (on ? "★" : "☆") + "<span>" + (on ? "已标记" : "标记") + "</span>";
+    }
+  }
+
+  function clearAllMarks() {
+    var n = 0;
+    SUBJECTS.forEach(function (s) {
+      var p = progress[s.id];
+      if (p && p.marks) n += Object.keys(p.marks).length;
+    });
+    if (!n) { toast("还没有标记"); return; }
+    if (!confirm("确定清空全部 " + n + " 个标记？")) return;
+    SUBJECTS.forEach(function (s) { if (progress[s.id]) delete progress[s.id].marks; });
+    saveProgress();
+    toast("已清空标记");
+    renderHome();
+  }
+
   function navStep(dir) {
     var s = currentSubject();
     if (!s) return;
@@ -914,13 +1036,28 @@
       applyScope(subj);
       renderScopeBtn();
       var p = subProgress(id);
+      var restoreTop = null;
+      var idAt = function (want) {
+        return subj.items.map(function (x) { return x.id; }).indexOf(want);
+      };
 
       if (typeof opts.index === "number") {
         state.index = Math.max(0, Math.min(opts.index, subj.items.length - 1));
+        if (typeof opts.page === "number") state.page = Math.max(0, opts.page);
+      } else if (typeof opts.id === "string") {
+        // 按知识点 id 定位（标记跳转用，不怕 applyScope 重排）
+        var mi = idAt(opts.id);
+        state.index = mi >= 0 ? mi : 0;
+        if (typeof opts.page === "number") state.page = Math.max(0, opts.page);
+      } else if (p.pos && p.pos.id && idAt(p.pos.id) >= 0) {
+        // 精确回到上次阅读的那一屏
+        state.index = idAt(p.pos.id);
+        state.page = Math.max(0, p.pos.pg || 0);
+        restoreTop = Math.max(0, p.pos.top || 0);
       } else {
         var idx = 0;
         if (p.current) {
-          var i = subj.items.map(function (x) { return x.id; }).indexOf(p.current);
+          var i = idAt(p.current);
           if (i >= 0) idx = i;
         } else if (Object.keys(p.done || {}).length) {
           idx = Math.min(Object.keys(p.done).length, subj.items.length - 1);
@@ -936,12 +1073,25 @@
         }
         state.index = idx;
       }
+
+      // 页码兜底：不得超过该知识点的实际页数
+      var pageNum = subj.items[state.index].pages.length;
+      state.page = Math.max(0, Math.min(state.page, pageNum - 1));
+
+      // 只要最终落点正是上次离开的那一屏，就把滚动像素一并还原。
+      // 覆盖「用 #/科目/序号 深链重新打开」这类不走 pos 分支的入口。
+      if (restoreTop == null && p.pos && p.pos.id === subj.items[state.index].id &&
+          Math.max(0, Math.min(p.pos.pg || 0, pageNum - 1)) === state.page) {
+        restoreTop = Math.max(0, p.pos.top || 0);
+      }
+
       if (!p.current) { p.current = subj.items[state.index].id; }
       p.at = state.index;
       p.ts = Date.now();
       saveProgress();
+      // 无恢复目标时显式归零，避免沿用上一个科目的滚动位置
+      state.restoreScroll = restoreTop == null ? 0 : restoreTop;
       renderStudy();
-      dom.viewStudy.scrollTop = 0;
       try {
         history.replaceState(null, "", "#/" + id + "/" + (state.index + 1));
       } catch (e) {}
@@ -949,6 +1099,7 @@
   }
 
   function goHome() {
+    if (state.subjectId) savePosition(true);
     state.subjectId = null;
     state.finished = false;
     renderHome();
@@ -1503,6 +1654,18 @@
     }).then(function (r) { return r.json(); });
   }
 
+  /* 标记按知识点 id 取并集，同一 id 保留时间较新的一份 */
+  function mergeMarks(a, b) {
+    var out = {};
+    [a || {}, b || {}].forEach(function (src) {
+      Object.keys(src).forEach(function (k) {
+        var cur = out[k], nv = src[k] || {};
+        if (!cur || (nv.ts || 0) > (cur.ts || 0)) out[k] = nv;
+      });
+    });
+    return out;
+  }
+
   function mergeProgress(local, remote) {
     var out = {};
     [local || {}, remote || {}].forEach(function (src) {
@@ -1511,7 +1674,8 @@
         if (!a) {
           out[k] = {
             done: Object.assign({}, b.done || {}),
-            current: b.current || null, at: b.at || 0, ts: b.ts || 0
+            current: b.current || null, at: b.at || 0, ts: b.ts || 0,
+            marks: mergeMarks(null, b.marks), pos: b.pos || null
           };
           return;
         }
@@ -1519,9 +1683,14 @@
         Object.keys(a.done || {}).forEach(function (d) { done[d] = 1; });
         Object.keys(b.done || {}).forEach(function (d) { done[d] = 1; });
         var newer = (b.ts || 0) > (a.ts || 0) ? b : a;
+        var older = newer === a ? b : a;
         out[k] = {
           done: done, current: newer.current || null,
-          at: newer.at || 0, ts: Math.max(a.ts || 0, b.ts || 0)
+          at: newer.at || 0, ts: Math.max(a.ts || 0, b.ts || 0),
+          marks: mergeMarks(a.marks, b.marks),
+          // 阅读位置取时间较新的那份，保证跨设备「继续上次」一致
+          pos: ((newer.pos && newer.pos.ts) || 0) >= ((older.pos && older.pos.ts) || 0)
+            ? (newer.pos || older.pos || null) : (older.pos || null)
         };
       });
     });
@@ -2056,6 +2225,14 @@
   document.addEventListener("click", function (e) {
     var t = e.target.closest ? e.target.closest("button") : null;
 
+    if (t && t.dataset.markId) {
+      openSubject(t.dataset.markSubj, {
+        id: t.dataset.markId,
+        page: parseInt(t.dataset.markPg, 10) || 0
+      });
+      return;
+    }
+    if (t && t.dataset.marksClear) { clearAllMarks(); return; }
     if (t && t.dataset.subject) { openSubject(t.dataset.subject); return; }
     if (t && t.dataset.go) {
       var idx = parseInt(t.dataset.index, 10);
@@ -2088,6 +2265,7 @@
     switch (t.id) {
       case "navPrev": navStep(-1); break;
       case "navNext": navStep(1); break;
+      case "markBtn": toggleMark(); break;
       case "bankHome": openQuizHome(); break;
       case "multiSubmit": quizMultiSubmit(); break;
       case "selfReveal": quiz.revealed = true; renderQuiz(); break;
@@ -2197,7 +2375,7 @@
       // 带版本号注册 + updateViaCache:"none"：
       // 1) URL 变化可绕过 CDN / 浏览器的旧缓存；
       // 2) 浏览器定期更新检查时也强制回源，避免长期停留在旧版 Service Worker。
-      navigator.serviceWorker.register("sw.js?v=27", { updateViaCache: "none" })
+      navigator.serviceWorker.register("sw.js?v=29", { updateViaCache: "none" })
         .then(function (reg) { if (reg && reg.update) reg.update(); })
         .catch(function () {});
     });
@@ -2220,8 +2398,16 @@
     if (e.key === "Escape") closeSearch();
   });
 
-  dom.viewStudy.addEventListener("scroll", checkScroll, { passive: true });
-  window.addEventListener("resize", checkScroll);
+  dom.viewStudy.addEventListener("scroll", onStudyScroll, { passive: true });
+  window.addEventListener("resize", onStudyScroll);
+  // 退出页面 / 切到后台时立刻落盘，保证下次打开能精确回到原位
+  window.addEventListener("pagehide", function () { savePosition(true); });
+  document.addEventListener("visibilitychange", function () {
+    if (document.visibilityState === "hidden") {
+      savePosition(true);
+      if (state.subjectId) saveProgress();
+    }
+  });
 
   document.addEventListener("keydown", function (e) {
     if (!dom.searchOverlay.hidden) return;
