@@ -18,7 +18,7 @@
 <link rel="icon" href="icon.svg" type="image/svg+xml">
 <link rel="icon" type="image/png" sizes="192x192" href="icon-192.png">
 <!-- 资源版本号：变更前端代码时同步 +1，可强制绕过 CDN / 浏览器旧缓存 -->
-<link rel="stylesheet" href="css/app.css?v=26">
+<link rel="stylesheet" href="css/app.css?v=27">
 </head>
 <body>
 <div class="app">
@@ -137,7 +137,7 @@
       <strong class="sheet-title">登录</strong>
     </div>
     <div class="sheet-body">
-      <p class="sheet-tip">输入账号密码，验证一次后自动免密进入。</p>
+      <p class="sheet-tip">输入账号密码，之后长期免密进入（会话到期会在后台自动续期）。</p>
       <input id="authUser" class="sync-input" type="text" placeholder="账号"
         autocomplete="username" autocapitalize="off" autocorrect="off"
         style="text-transform:none;letter-spacing:0">
@@ -149,7 +149,7 @@
   </div>
 </div>
 
-<script src="js/supabase.js?v=26"></script>
-<script src="js/app.js?v=26"></script>
+<script src="js/supabase.js?v=27"></script>
+<script src="js/app.js?v=27"></script>
 </body>
 </html>

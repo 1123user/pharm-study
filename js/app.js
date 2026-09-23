@@ -22,7 +22,12 @@
   var WEAK_KEY = "study3.weak.v1";
   var SYNC_KEY = "study3.sync.code";
   var PLAN_KEY = "study3.plan.v1";
-  var AUTH_KEY = "study3.auth.token";
+  // 登录会话：同时保存 access_token（1 小时）与 refresh_token（长期），
+  // 过期时用 refresh 静默换新，避免每次进入都重新输密码。
+  var AUTH_KEY = "study3.auth.session";
+  var AUTH_LEGACY_KEY = "study3.auth.token";
+  var AUTH_USER_KEY = "study3.auth.user";
+  var PLAN_EMAIL_KEY = "study3.plan.email";
   var SB = window.SUPABASE_CONFIG || {};
   var SB_URL = (SB.url || "").replace(/\/+$/, "");
   var SB_KEY = SB.anonKey || "";
@@ -111,28 +116,193 @@
     return progress[id];
   }
 
-  /* ---------------- 登录门控（Supabase Auth） ---------------- */
-  function getToken() { return localStorage.getItem(AUTH_KEY) || ""; }
-  function setToken(t) { if (t) localStorage.setItem(AUTH_KEY, t); else localStorage.removeItem(AUTH_KEY); }
-  function authHeaders() {
-    return { "apikey": SB_KEY, "Authorization": "Bearer " + getToken() };
+  /* ---------------- 登录门控（Supabase Auth） ----------------
+     设计要点（解决"每次进入都要重新登录"）：
+     1) access_token 只有 1 小时，必须连同 refresh_token 一起持久化，
+        到期用 refresh 静默换新，用户不必再次输入密码；
+     2) 过期判断以本地 exp 为准，能在后台提前续期，不必等到 401 才发现；
+     3) 网络异常（断网、超时、5xx）一律保留会话 —— 不能因为"网络抖一下"
+        就把已登录用户踢回登录页，这是之前反复要求重登的主因；
+     4) 只有服务端明确拒绝（401/403、refresh 失效）才算会话过期。 */
+  function getSession() {
+    try {
+      var s = JSON.parse(localStorage.getItem(AUTH_KEY) || "null");
+      if (s && s.access) return s;
+    } catch (e) {}
+    // 兼容旧版：只存过 access_token，没有 refresh_token
+    var legacy = localStorage.getItem(AUTH_LEGACY_KEY) || "";
+    if (!legacy) return null;
+    return { access: legacy, refresh: "", exp: 0, email: localStorage.getItem(AUTH_USER_KEY) || "" };
   }
-  function showAuthGate() { var g = $("authGate"); if (g) g.hidden = false; }
+  function saveSession(j, email) {
+    var prev = getSession() || {};
+    var s = {
+      access: j.access_token || prev.access || "",
+      refresh: j.refresh_token || prev.refresh || "",
+      exp: Date.now() + (j.expires_in || 3600) * 1000,
+      email: email || prev.email || ""
+    };
+    try { localStorage.setItem(AUTH_KEY, JSON.stringify(s)); } catch (e) {}
+    try { localStorage.removeItem(AUTH_LEGACY_KEY); } catch (e) {}
+    if (s.email) { try { localStorage.setItem(AUTH_USER_KEY, s.email); } catch (e) {} }
+    scheduleTokenRefresh();
+    return s;
+  }
+  function clearSession() {
+    try { localStorage.removeItem(AUTH_KEY); } catch (e) {}
+    try { localStorage.removeItem(AUTH_LEGACY_KEY); } catch (e) {}
+    stopTokenRefresh();
+  }
+  function getToken() { var s = getSession(); return (s && s.access) || ""; }
+  function showAuthGate() { var g = $("authGate"); if (g) g.hidden = false; prefillAuthForm(); }
   function hideAuthGate() { var g = $("authGate"); if (g) g.hidden = true; }
-  function authGuard() {
-    var t = getToken();
-    if (!t) { showAuthGate(); return Promise.resolve(false); }
-    return fetch(SB_URL + "/auth/v1/user", {
-      headers: { "apikey": SB_KEY, "Authorization": "Bearer " + t }
-    }).then(function (r) { return r.ok; })
-      .catch(function () { return false; })
-      .then(function (ok) {
-        if (ok) { hideAuthGate(); return true; }
-        setToken("");
-        showAuthGate();
-        return false;
+  function prefillAuthForm() {
+    var u = $("authUser");
+    if (!u || u.value) return;
+    var s = getSession();
+    var email = (s && s.email) || localStorage.getItem(AUTH_USER_KEY) || "";
+    var cut = email.indexOf(SB_SUFFIX);
+    u.value = cut > 0 ? email.slice(0, cut) : email;
+  }
+
+  function authLogin(email, password) {
+    return fetch(SB_URL + "/auth/v1/token?grant_type=password", {
+      method: "POST",
+      headers: { "apikey": SB_KEY, "Content-Type": "application/json" },
+      body: JSON.stringify({ email: email, password: password })
+    }).then(function (r) {
+      return r.json().then(function (j) {
+        if (!r.ok || !j || !j.access_token) {
+          var e = new Error((j && (j.error_description || j.msg || j.message)) || "账号或密码不正确");
+          e.status = r.status;
+          throw e;
+        }
+        return saveSession(j, email);
+      });
+    });
+  }
+
+  /* 静默续期：仅当服务端明确拒绝 refresh_token 时才视为会话失效 */
+  function authRefresh() {
+    var s = getSession();
+    if (!s || !s.refresh) {
+      var e0 = new Error("会话已过期");
+      e0.status = 401;
+      return Promise.reject(e0);
+    }
+    return fetch(SB_URL + "/auth/v1/token?grant_type=refresh_token", {
+      method: "POST",
+      headers: { "apikey": SB_KEY, "Content-Type": "application/json" },
+      body: JSON.stringify({ refresh_token: s.refresh })
+    }).then(function (r) {
+      return r.json().then(function (j) {
+        if (!r.ok || !j || !j.access_token) {
+          var e = new Error("会话已过期");
+          e.status = (r.status === 400 || r.status === 401) ? r.status : 401;
+          throw e;
+        }
+        return saveSession(j, s.email);
+      });
+    }).catch(function (e) {
+      if (!e || !e.status) { var e2 = e instanceof Error ? e : new Error("网络异常"); e2.network = true; throw e2; }
+      throw e;
+    });
+  }
+
+  /* 保证拿到可用 token：本地已过期就先静默续期，不惊动用户 */
+  function ensureToken() {
+    var s = getSession();
+    if (!s) { var e = new Error("未登录"); e.needLogin = true; return Promise.reject(e); }
+    if (s.access && s.exp && Date.now() < s.exp - 30000) return Promise.resolve(s.access);
+    return authRefresh().then(function (ns) { return ns.access; })
+      .catch(function (err) {
+        if (err && err.status) { err.needLogin = true; throw err; }
+        if (s.access) return s.access;   // 断网：先用旧 token 试，避免直接弹登录
+        throw err;
       });
   }
+
+  /* 提前续期，让"打开即用"不依赖当次的网络握手 */
+  var tokenTimer = null;
+  function stopTokenRefresh() { if (tokenTimer) { clearTimeout(tokenTimer); tokenTimer = null; } }
+  function scheduleTokenRefresh() {
+    stopTokenRefresh();
+    var s = getSession();
+    if (!s || !s.refresh || !s.exp) return;
+    var delay = Math.max(30000, s.exp - Date.now() - 300000);   // 到期前 5 分钟续期
+    tokenTimer = setTimeout(function () {
+      tokenTimer = null;
+      authRefresh().catch(function () {}).then(scheduleTokenRefresh);
+    }, delay);
+  }
+
+  /* 回到前台 / 网络恢复时主动检查一次会话（移动端会被系统挂起定时器） */
+  function sessionKeepAlive() {
+    var s = getSession();
+    if (!s || !s.refresh) return;
+    if (!s.exp || s.exp - Date.now() < 600000) authRefresh().catch(function () {});
+  }
+
+  function authVerify(token) {
+    return fetch(SB_URL + "/auth/v1/user", {
+      headers: { "apikey": SB_KEY, "Authorization": "Bearer " + token }
+    }).then(function (r) {
+      if (r.ok) return true;
+      if (r.status === 401 || r.status === 403) return false;
+      return "offline";                      // 5xx / 网关异常：不代表会话失效
+    }).catch(function () { return "offline"; });
+  }
+
+  function authGuard() {
+    var s = getSession();
+    if (!s) { showAuthGate(); return Promise.resolve(false); }
+
+    function refreshOrGate() {
+      if (!s.refresh) { clearSession(); showAuthGate(); return false; }
+      return authRefresh().then(function () {
+        hideAuthGate();
+        return true;
+      }).catch(function (e) {
+        if (e && e.status) { clearSession(); showAuthGate(); return false; }
+        toast("网络不可用，已离线进入");
+        hideAuthGate();
+        scheduleTokenRefresh();
+        return true;
+      });
+    }
+
+    // 已在本地过期或临期：直接静默续期，用户无感知
+    if (s.exp && s.exp - Date.now() < 120000) return Promise.resolve(refreshOrGate());
+
+    return authVerify(s.access).then(function (ok) {
+      if (ok === true) { hideAuthGate(); scheduleTokenRefresh(); return true; }
+      if (ok === false) return refreshOrGate();
+      toast("网络不可用，已离线进入");       // 网络原因：保留会话，不要求重登
+      hideAuthGate();
+      scheduleTokenRefresh();
+      return true;
+    });
+  }
+
+  /* 带鉴权的请求：token 过期时自动续期并重试一次 */
+  function apiFetch(url, init) {
+    init = init || {};
+    return ensureToken().then(function (token) {
+      function call(tk) {
+        var h = Object.assign({ "apikey": SB_KEY, "Authorization": "Bearer " + tk },
+          init.headers || {});
+        return fetch(url, Object.assign({}, init, { headers: h }));
+      }
+      return call(token).then(function (r) {
+        if (r.status !== 401) return r;
+        return authRefresh().catch(function () { return null; }).then(function (ns) {
+          if (!ns) return r;
+          return call(ns.access);
+        });
+      });
+    });
+  }
+
   function bindAuthLogin() {
     var btn = $("authGo");
     if (!btn) return;
@@ -144,20 +314,14 @@
       btn.disabled = true;
       btn.textContent = "登录中…";
       if (err) err.textContent = "";
-      fetch(SB_URL + "/auth/v1/token?grant_type=password", {
-        method: "POST",
-        headers: { "apikey": SB_KEY, "Content-Type": "application/json" },
-        body: JSON.stringify({ email: u + SB_SUFFIX, password: p })
-      }).then(function (r) { return r.json(); }).then(function (j) {
-        if (j && j.access_token) {
-          setToken(j.access_token);
-          hideAuthGate();
-          boot();
-        } else {
-          if (err) err.textContent = (j && (j.error_description || j.msg)) || "登录失败，请重试";
-        }
-      }).catch(function () {
-        if (err) err.textContent = "网络错误，请重试";
+      var email = u.indexOf("@") >= 0 ? u : u + SB_SUFFIX;
+      authLogin(email, p).then(function () {
+        hideAuthGate();
+        var pe = $("authPass");
+        if (pe) pe.value = "";
+        boot();
+      }).catch(function (e) {
+        if (err) err.textContent = (e && e.message) || "登录失败，请重试";
       }).then(function () {
         btn.disabled = false;
         btn.textContent = "登录";
@@ -176,7 +340,7 @@
     return new Promise(function (resolve) {
       var cached = getSubject(id);
       if (cached) return resolve(cached);
-      fetch(fnUrl("get-data") + "?name=" + id, { headers: authHeaders() })
+      apiFetch(fnUrl("get-data") + "?name=" + id)
         .then(function (r) { return r.ok ? r.json() : null; })
         .then(function (j) {
           if (j) {
@@ -869,7 +1033,7 @@
 
   function loadQuiz() {
     if (window.STUDY_QUIZ) return Promise.resolve(window.STUDY_QUIZ);
-    return fetch(fnUrl("get-data") + "?name=quiz", { headers: authHeaders() })
+    return apiFetch(fnUrl("get-data") + "?name=quiz")
       .then(function (r) { return r.ok ? r.json() : []; })
       .then(function (j) { if (j) window.STUDY_QUIZ = j; return window.STUDY_QUIZ || []; })
       .catch(function () { return []; });
@@ -1327,15 +1491,14 @@
     if (el) el.textContent = t;
   }
   function apiGet(code) {
-    return fetch(fnUrl("sync") + "?code=" + encodeURIComponent(code), {
-      cache: "no-store",
-      headers: authHeaders()
+    return apiFetch(fnUrl("sync") + "?code=" + encodeURIComponent(code), {
+      cache: "no-store"
     }).then(function (r) { return r.json(); });
   }
   function apiPost(code, data) {
-    return fetch(fnUrl("sync"), {
+    return apiFetch(fnUrl("sync"), {
       method: "POST",
-      headers: Object.assign({ "Content-Type": "application/json" }, authHeaders()),
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ code: code, data: data })
     }).then(function (r) { return r.json(); });
   }
@@ -1614,9 +1777,16 @@
       body: JSON.stringify(body)
     }).then(function (r) {
       return r.json().then(function (j) {
-        if (!r.ok) throw new Error(j.msg || j.error_description || j.message || ("HTTP " + r.status));
+        if (!r.ok) {
+          var e = new Error(j.msg || j.error_description || j.message || ("HTTP " + r.status));
+          e.status = r.status;                 // 服务端明确拒绝
+          throw e;
+        }
         return j;
       });
+    }).catch(function (e) {
+      if (!e || !e.status) { e = new Error("网络不可用"); e.network = true; }
+      throw e;
     });
   }
 
@@ -1632,6 +1802,11 @@
       .then(function (j) {
         savePlanSession(j, s.email);
         return j.access_token;
+      })
+      .catch(function (e) {
+        // 断网时先用旧 token 顶一次，不要因为一次网络失败就让用户重输密码
+        if (e && e.network && s.token) return s.token;
+        throw e;
       });
   }
 
@@ -1649,6 +1824,7 @@
     return planAuth({ email: email, password: pwd }, "/token?grant_type=password")
       .then(function (j) {
         savePlanSession(j, email);
+        try { localStorage.setItem(PLAN_EMAIL_KEY, email); } catch (e) {}
         return pullPlan();
       })
       .catch(function (e) {
@@ -1658,12 +1834,55 @@
       });
   }
 
-  function pullPlan() {
+  /* 启动 / 回到前台时自动同步今日计划：已连接的会话无需任何点击与密码 */
+  var planRetryTimer = null;
+  var planRetryCount = 0;
+  function planAutoPull(force) {
+    if (!planSession()) return;
+    if (!force && planIsToday()) return;
+    pullPlan().catch(function () {});
+  }
+
+  /* 单次读取：token 被服务端拒绝时抛带 status 的错误 */
+  function planFetchOnce() {
     return planToken().then(function (token) {
       return fetch(PLAN_URL + "/rest/v1/progress?select=id,st,updated_at&limit=1", {
         headers: { "apikey": PLAN_ANON, "Authorization": "Bearer " + token }
-      }).then(function (r) { return r.json(); });
+      }).then(function (r) {
+        if (r.status === 401 || r.status === 403) {
+          var e = new Error("计划登录已过期");
+          e.status = r.status;
+          throw e;
+        }
+        return r.json();
+      });
+    });
+  }
+
+  function pullPlan() {
+    return planFetchOnce().catch(function (e) {
+      // token 被服务端拒绝：先强制换新再试一次（本地时钟偏差/被提前吊销都属此类），
+      // 只有换新也失败才认为会话真的失效，避免让用户白输一次密码。
+      if (e && e.status) {
+        var s = planSession();
+        if (s && s.refresh) {
+          s.token = "";
+          s.exp = 0;
+          try { localStorage.setItem(PLAN_AUTH_KEY, JSON.stringify(s)); } catch (err) {}
+          return planFetchOnce();
+        }
+      }
+      throw e;
+    }).catch(function (e) {
+      // 只区分"网络问题"与"被服务端拒绝"：网络问题绝不清除会话
+      if (!e || !e.status) {
+        var n = e instanceof Error ? e : new Error("网络不可用");
+        n.network = true;
+        throw n;
+      }
+      throw e;
     }).then(function (rows) {
+      planRetryCount = 0;                    // 网络已恢复，重置自动重试计数
       var row = Array.isArray(rows) && rows[0];
       if (!row || !row.st) throw new Error("云端暂无计划数据");
       var snap = row.st.daySnap || null;
@@ -1693,6 +1912,27 @@
       if (state.subjectId) renderStudy();
       toast("今日计划：" + built.ids.length + " 新学 · " + built.rev.length + " 回顾");
       return true;
+    }).catch(function (e) {
+      if (e && e.network) {
+        // 断网 / 超时：保留会话，稍后自动重试，不要求重新登录
+        setPlanStatus("网络不可用，稍后自动重试…");
+        if (!planRetryTimer && planRetryCount < 6) {
+          planRetryCount++;
+          planRetryTimer = setTimeout(function () {
+            planRetryTimer = null;
+            planAutoPull(true);
+          }, 30000);
+        }
+        throw e;
+      }
+      planRetryCount = 0;
+      if (e && (e.status === 400 || e.status === 401)) {
+        // refresh_token 被服务端拒绝：仅此时才需要重新连接一次
+        try { localStorage.removeItem(PLAN_AUTH_KEY); } catch (err) {}
+        renderPlanPanel();
+        setPlanStatus("登录已过期，请重新连接复习计划");
+      }
+      throw e;
     });
   }
 
@@ -1856,16 +2096,28 @@
       case "quizNext": quizNext(); break;
       case "quizAgain": startQuiz(); break;
       case "quizHome": goHome(); break;
-      case "planLoginBtn":
+      case "planLoginBtn": {
         $("planLogin").hidden = false;
+        var pe = $("planEmail");
+        if (pe && !pe.value) {
+          var ps = planSession();
+          var em0 = (ps && ps.email) || localStorage.getItem(PLAN_EMAIL_KEY) || "";
+          if (em0) pe.value = em0;              // 只在这里输一次，之后靠会话免密
+        }
         setTimeout(function () { var e = $("planEmail"); if (e) e.focus(); }, 80);
         break;
+      }
       case "planLoginClose": $("planLogin").hidden = true; break;
       case "planLoginGo": {
         var em = ($("planEmail") || {}).value || "";
         var pw = ($("planPwd") || {}).value || "";
         if (!em || !pw) { toast("请填写邮箱和密码"); break; }
-        planConnect(em.trim(), pw).then(function () { $("planLogin").hidden = true; });
+        planConnect(em.trim(), pw).then(function (ok) {
+          if (ok !== false) {
+            $("planLogin").hidden = true;
+            $("planPwd").value = "";
+          }
+        });
         break;
       }
       case "planRefresh": pullPlan(); break;
@@ -1945,7 +2197,7 @@
       // 带版本号注册 + updateViaCache:"none"：
       // 1) URL 变化可绕过 CDN / 浏览器的旧缓存；
       // 2) 浏览器定期更新检查时也强制回源，避免长期停留在旧版 Service Worker。
-      navigator.serviceWorker.register("sw.js?v=26", { updateViaCache: "none" })
+      navigator.serviceWorker.register("sw.js?v=27", { updateViaCache: "none" })
         .then(function (reg) { if (reg && reg.update) reg.update(); })
         .catch(function () {});
     });
@@ -2010,10 +2262,28 @@
       if (dom.quizTotal && all && all.length) dom.quizTotal.textContent = all.length + " 题";
     });
     if (state.syncCode) setTimeout(function () { syncNow(true); }, 800);
-    if (planSession() && !planIsToday()) {
-      setTimeout(function () { pullPlan().catch(function () {}); }, 1500);
-    }
+    // 今日计划：启动时静默同步一次（已连接过的会话不再要求输入密码）
+    setTimeout(function () { planAutoPull(); }, 1200);
+    scheduleTokenRefresh();
   }
+
+  /* 回到前台 / 网络恢复：补一次会话续期与计划同步。
+     移动端（尤其 iOS 主屏应用）会把页面冻结，定时器不可靠，
+     靠这两个事件补上，保证"打开就是已登录、计划已是最新"。 */
+  var lastWake = 0;
+  function wakeUp() {
+    var t = Date.now();
+    if (t - lastWake < 60000) return;      // 频繁切前后台时不必每次都打网络
+    lastWake = t;
+    sessionKeepAlive();
+    planAutoPull();
+    if (state.syncCode) setTimeout(function () { syncNow(true); }, 300);
+  }
+  document.addEventListener("visibilitychange", function () {
+    if (!document.hidden) wakeUp();
+  });
+  window.addEventListener("online", wakeUp);
+  window.addEventListener("pageshow", function () { sessionKeepAlive(); });
 
   // 立即渲染首屏骨架：首页/侧边栏用静态条目数即可渲染，不依赖数据文件，
   // 消除「等待登录校验 + 下载大体积数据」造成的白屏。
